@@ -1,0 +1,37 @@
+# Build & Output Directories
+out/
+build/
+bin/
+dist/
+*.dir/
+
+# Visual Studio / IDE Files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vscode/
+CMakeUserPresets.json
+
+# Compiled binaries and intermediate files
+*.obj
+*.o
+*.lib
+*.a
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.exe
+*.dll
+
+# Media & Recordings
+*.mp4
+*.mkv
+*.wav
+*.aac
+
+# Logs & Temp files
+*.log
+scratch/
