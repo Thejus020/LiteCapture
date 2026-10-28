@@ -39,6 +39,18 @@ Core::Status RecordingController::Initialize(Graphics::D3D11DeviceManager* graph
 void RecordingController::Shutdown() {
     StopRecording();
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_encoderThreadRunning.load()) {
+        m_encoderThreadRunning.store(false);
+        m_queueCv.notify_all();
+        if (m_encoderThread.joinable()) {
+            m_encoderThread.join();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> qLock(m_queueMutex);
+        m_texturePool.clear();
+        while (!m_frameQueue.empty()) m_frameQueue.pop();
+    }
     if (m_audioCapture) {
         m_audioCapture->Stop();
     }
@@ -66,7 +78,11 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
 
     m_framesReceived = 0;
     m_audioFramesReceived = 0;
+    m_framesDroppedQueue = 0;
     m_recordStartTimeNs = Core::GetCurrentTimeNs();
+
+    m_targetWidth = config.activeProfile.width;
+    m_targetHeight = config.activeProfile.height;
 
     // 1. Generate timestamped MP4 recording file path
     auto now = std::chrono::system_clock::now();
@@ -85,11 +101,30 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
 
     bool audioEnabled = config.captureSystemAudio || config.captureMicrophone;
 
-    // 2. Initialize Media Foundation H.264 video & AAC audio encoder
+    // 2. Pre-allocate dedicated GPU staging texture pool for decoupled capture and zero-wait backpressure
+    {
+        std::lock_guard<std::mutex> qLock(m_queueMutex);
+        m_texturePool.clear();
+        while (!m_frameQueue.empty()) m_frameQueue.pop();
+        for (size_t i = 0; i < TEXTURE_POOL_SIZE; ++i) {
+            auto texResult = m_graphicsMgr->CreateTexture2D(
+                m_targetWidth, m_targetHeight,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                D3D11_USAGE_DEFAULT,
+                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+                0
+            );
+            if (texResult.IsOk()) {
+                m_texturePool.push_back(texResult.Value());
+            }
+        }
+    }
+
+    // 3. Initialize Media Foundation H.264 video & AAC audio encoder
     Encoder::EncoderConfig encConfig{};
     encConfig.outputPath = m_activeRecordingPath;
-    encConfig.width = config.activeProfile.width;
-    encConfig.height = config.activeProfile.height;
+    encConfig.width = m_targetWidth;
+    encConfig.height = m_targetHeight;
     encConfig.fps = config.activeProfile.fps;
     encConfig.bitrateBps = config.activeProfile.BitrateBps();
     encConfig.preferHardware = true;
@@ -105,7 +140,11 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
         return encStatus;
     }
 
-    // 3. Start audio capture (System loopback + Microphone)
+    // 4. Start dedicated asynchronous video encoder thread
+    m_encoderThreadRunning.store(true);
+    m_encoderThread = std::thread(&RecordingController::EncoderThreadProc, this);
+
+    // 5. Start audio capture (System loopback + Microphone)
     if (audioEnabled && m_audioCapture) {
         Audio::AudioConfig audioCfg{};
         audioCfg.captureSystemAudio = config.captureSystemAudio;
@@ -128,7 +167,7 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
         }
     }
 
-    // 4. Start screen capture session on an MTA worker thread
+    // 6. Start screen capture session on an MTA worker thread
     auto future = std::async(std::launch::async, [this, config, source]() -> Core::Status {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         auto captureCallback = [this](const Capture::CapturedFrame& frame) {
@@ -140,6 +179,11 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
     auto status = future.get();
     if (status.IsError()) {
         if (m_audioCapture) m_audioCapture->Stop();
+        if (m_encoderThreadRunning.load()) {
+            m_encoderThreadRunning.store(false);
+            m_queueCv.notify_all();
+            if (m_encoderThread.joinable()) m_encoderThread.join();
+        }
         m_encoder->Finalize();
         SetState(RecordingState::Error, status.Message());
         return status;
@@ -171,6 +215,21 @@ Core::Status RecordingController::StopRecording() {
         m_captureEngine->StopCapture();
     }
 
+    // Stop and drain the asynchronous video encoding thread
+    if (m_encoderThreadRunning.load()) {
+        m_encoderThreadRunning.store(false);
+        m_queueCv.notify_all();
+        if (m_encoderThread.joinable()) {
+            m_encoderThread.join();
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> qLock(m_queueMutex);
+        m_texturePool.clear();
+        while (!m_frameQueue.empty()) m_frameQueue.pop();
+    }
+
     SetState(RecordingState::Finalizing, L"Finalizing MP4 video file...");
 
     // Finalize H.264 encoder and flush MP4 container
@@ -193,10 +252,12 @@ RecordingState RecordingController::GetState() const {
 }
 
 Capture::CaptureStats RecordingController::GetStats() const {
+    Capture::CaptureStats stats{};
     if (m_captureEngine) {
-        return m_captureEngine->GetStats();
+        stats = m_captureEngine->GetStats();
+        stats.framesDropped += m_framesDroppedQueue.load();
     }
-    return {};
+    return stats;
 }
 
 Encoder::EncoderStats RecordingController::GetEncoderStats() const {
@@ -243,21 +304,133 @@ void RecordingController::SetState(RecordingState newState, const std::wstring& 
 }
 
 void RecordingController::OnCapturedFrame(const Capture::CapturedFrame& frame) {
+    if (!m_encoderThreadRunning.load() || !frame.texture) {
+        return;
+    }
+
     uint64_t count = ++m_framesReceived;
 
-    // Feed captured Direct3D 11 texture into the H.264 video encoder
-    if (m_encoder && m_encoder->IsInitialized()) {
-        auto encStatus = m_encoder->EncodeFrame(frame);
-        if (encStatus.IsError()) {
-            LC_LOG_WARN(std::format(L"Failed to encode frame #{}: {}", count, encStatus.Message()));
+    Core::ComPtr<ID3D11Texture2D> stagingTexture;
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        if (!m_texturePool.empty()) {
+            stagingTexture = m_texturePool.back();
+            m_texturePool.pop_back();
+        } else if (m_frameQueue.size() >= MAX_QUEUE_DEPTH) {
+            // Queue is full! Backpressure policy: drop oldest frame to prevent unbounded memory growth
+            stagingTexture = m_frameQueue.front().texture;
+            m_frameQueue.pop();
+            m_framesDroppedQueue++;
         }
     }
 
+    if (!stagingTexture) {
+        m_framesDroppedQueue++;
+        return;
+    }
+
+    // Instant GPU-to-GPU copy (<0.05ms) - frees WGC's surface immediately!
+    if (frame.width == m_targetWidth && frame.height == m_targetHeight) {
+        m_graphicsMgr->GetContext()->CopyResource(stagingTexture.Get(), frame.texture.Get());
+    } else {
+        D3D11_BOX srcBox{};
+        srcBox.left = 0;
+        srcBox.top = 0;
+        srcBox.front = 0;
+        srcBox.right = (std::min)(frame.width, m_targetWidth);
+        srcBox.bottom = (std::min)(frame.height, m_targetHeight);
+        srcBox.back = 1;
+
+        m_graphicsMgr->GetContext()->CopySubresourceRegion(
+            stagingTexture.Get(), 0, 0, 0, 0,
+            frame.texture.Get(), 0, &srcBox
+        );
+    }
+
+    // Push into bounded queue for asynchronous encoding
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        QueuedFrame qf;
+        qf.texture = stagingTexture;
+        qf.timestampNs = frame.timestampNs;
+        qf.durationNs = frame.durationNs;
+        qf.width = m_targetWidth;
+        qf.height = m_targetHeight;
+        qf.frameIndex = frame.frameIndex;
+        m_frameQueue.push(std::move(qf));
+    }
+    m_queueCv.notify_one();
+
     // Periodic log inspection every 180 frames (~3 seconds at 60fps)
     if (count % 180 == 1) {
-        LC_LOG_DEBUG(std::format(L"Encoded frame #{}: {}x{}, D3D11Texture={:p}, TimestampNs={}",
-            count, frame.width, frame.height, static_cast<void*>(frame.texture.Get()), frame.timestampNs));
+        LC_LOG_DEBUG(std::format(L"Captured frame #{}: {}x{}, TimestampNs={}",
+            count, frame.width, frame.height, frame.timestampNs));
     }
+}
+
+void RecordingController::EncoderThreadProc() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
+    while (m_encoderThreadRunning.load()) {
+        QueuedFrame qf;
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+            m_queueCv.wait(lock, [this]() {
+                return !m_frameQueue.empty() || !m_encoderThreadRunning.load();
+            });
+
+            if (m_frameQueue.empty()) {
+                if (!m_encoderThreadRunning.load()) break;
+                continue;
+            }
+
+            qf = std::move(m_frameQueue.front());
+            m_frameQueue.pop();
+        }
+
+        if (m_encoder && m_encoder->IsInitialized()) {
+            Capture::CapturedFrame capFrame{};
+            capFrame.texture = qf.texture;
+            capFrame.timestampNs = qf.timestampNs;
+            capFrame.durationNs = qf.durationNs;
+            capFrame.width = qf.width;
+            capFrame.height = qf.height;
+            capFrame.frameIndex = qf.frameIndex;
+
+            m_encoder->EncodeFrame(capFrame);
+        }
+
+        // Recycle texture back into pool
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_texturePool.push_back(qf.texture);
+        }
+    }
+
+    // Drain any remaining frames on shutdown so no captured frames are lost
+    while (true) {
+        QueuedFrame qf;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (m_frameQueue.empty()) break;
+            qf = std::move(m_frameQueue.front());
+            m_frameQueue.pop();
+        }
+
+        if (m_encoder && m_encoder->IsInitialized()) {
+            Capture::CapturedFrame capFrame{};
+            capFrame.texture = qf.texture;
+            capFrame.timestampNs = qf.timestampNs;
+            capFrame.durationNs = qf.durationNs;
+            capFrame.width = qf.width;
+            capFrame.height = qf.height;
+            capFrame.frameIndex = qf.frameIndex;
+            m_encoder->EncodeFrame(capFrame);
+        }
+    }
+
+    CoUninitialize();
 }
 
 void RecordingController::OnAudioFrame(const int16_t* pcm16, uint32_t frameCount, int64_t timestampNs) {

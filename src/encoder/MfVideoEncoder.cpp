@@ -22,7 +22,7 @@ MfVideoEncoder::~MfVideoEncoder() {
 }
 
 Core::Status MfVideoEncoder::Initialize(Graphics::D3D11DeviceManager* graphicsMgr, const EncoderConfig& config) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_lifecycleMutex);
 
     if (!graphicsMgr || !graphicsMgr->IsInitialized()) {
         return Core::Status::Error(Core::StatusCode::NotInitialized, L"D3D11 graphics manager not initialized");
@@ -34,6 +34,7 @@ Core::Status MfVideoEncoder::Initialize(Graphics::D3D11DeviceManager* graphicsMg
 
     m_graphicsMgr = graphicsMgr;
     m_config = config;
+    m_cachedBufferLength = m_config.width * m_config.height * 4;
 
     // Ensure output directory exists
     std::filesystem::path outDir = std::filesystem::path(m_config.outputPath).parent_path();
@@ -138,6 +139,8 @@ Core::Status MfVideoEncoder::CreateMediaTypes() {
     MFSetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, m_config.width, m_config.height);
     outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     MFSetAttributeRatio(outputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    outputType->SetUINT32(MF_MT_MPEG2_PROFILE, 100 /* eAVEncH264VProfile_High */);
+    outputType->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, m_config.fps * 2);
 
     hr = m_sinkWriter->AddStream(outputType.Get(), &m_streamIndex);
     if (FAILED(hr)) {
@@ -229,7 +232,7 @@ Core::Status MfVideoEncoder::EncodeAudioFrame(const int16_t* pcm16, uint32_t fra
         return Core::Status::Ok();
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_audioMutex);
 
     // Synchronize audio start: wait until the first video frame arrives before encoding audio.
     // This guarantees both video and audio start at the exact same physical moment at PTS = 0.
@@ -293,7 +296,7 @@ Core::Status MfVideoEncoder::EncodeFrame(const Capture::CapturedFrame& frame) {
         return Core::Status::Error(Core::StatusCode::InvalidParameter, L"Frame texture is null");
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_videoMutex);
 
     if (m_firstFrameTimestampNs == 0) {
         m_firstFrameTimestampNs = frame.timestampNs;
@@ -356,20 +359,8 @@ Core::Status MfVideoEncoder::EncodeFrame(const Capture::CapturedFrame& frame) {
         return Core::Status::FromHResult(hr, L"MFCreateDXGISurfaceBuffer");
     }
 
-    // CRITICAL: Set valid buffer length (required by SinkWriter to avoid E_INVALIDARG 0x80070057)
-    Core::ComPtr<IMF2DBuffer> buffer2D;
-    hr = mediaBuffer.As(&buffer2D);
-    if (SUCCEEDED(hr)) {
-        DWORD length = 0;
-        if (SUCCEEDED(buffer2D->GetContiguousLength(&length))) {
-            mediaBuffer->SetCurrentLength(length);
-        }
-    } else {
-        DWORD maxLen = 0;
-        if (SUCCEEDED(mediaBuffer->GetMaxLength(&maxLen))) {
-            mediaBuffer->SetCurrentLength(maxLen);
-        }
-    }
+    // Set valid buffer length (cached to avoid per-frame COM QueryInterface overhead)
+    mediaBuffer->SetCurrentLength(m_cachedBufferLength);
 
     // Create Media Foundation sample
     Core::ComPtr<IMFSample> sample;
@@ -408,7 +399,7 @@ Core::Status MfVideoEncoder::EncodeFrame(const Capture::CapturedFrame& frame) {
 }
 
 Core::Status MfVideoEncoder::Finalize() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::scoped_lock lock(m_lifecycleMutex, m_videoMutex, m_audioMutex);
 
     if (!m_initialized) {
         return Core::Status::Ok();

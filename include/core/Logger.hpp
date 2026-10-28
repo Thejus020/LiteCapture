@@ -24,8 +24,8 @@ public:
 
     void Log(LogLevel level, std::wstring_view message, const char* file = nullptr, int line = 0);
 
-    void SetMinLevel(LogLevel level) { m_minLevel = level; }
-    LogLevel GetMinLevel() const { return m_minLevel; }
+    void SetMinLevel(LogLevel level) noexcept { m_minLevel = level; }
+    LogLevel GetMinLevel() const noexcept { return m_minLevel; }
     const std::wstring& GetLogFilePath() const { return m_logFilePath; }
 
 private:
@@ -44,12 +44,26 @@ private:
     bool m_initialized{false};
 };
 
-// Convenience logging functions
-inline void LogMessage(LogLevel level, const std::wstring& msg, const char* file = nullptr, int line = 0) {
+// Fast zero-allocation path separator finder
+constexpr const char* ExtractFilename(const char* path) noexcept {
+    if (!path) return "";
+    const char* lastSlash = path;
+    for (const char* p = path; *p; ++p) {
+        if (*p == '\\' || *p == '/') {
+            lastSlash = p + 1;
+        }
+    }
+    return lastSlash;
+}
+
+// Convenience logging functions with zero-cost early level filtering
+inline void LogMessage(LogLevel level, std::wstring_view msg, const char* file = nullptr, int line = 0) {
+    if (level < Logger::Instance().GetMinLevel()) return;
     Logger::Instance().Log(level, msg, file, line);
 }
 
 inline void LogHResult(LogLevel level, HRESULT hr, const std::wstring& context, const char* file = nullptr, int line = 0) {
+    if (level < Logger::Instance().GetMinLevel()) return;
     std::wstring fullMsg = std::format(L"{}: {} (0x{:08X})", context, HResultToString(hr), static_cast<uint32_t>(hr));
     Logger::Instance().Log(level, fullMsg, file, line);
 }

@@ -41,6 +41,25 @@ if(MSVC)
     )
     # Enable multi-processor compilation
     add_compile_options(/MP)
+
+    # High-performance Release optimizations: maximum speed, intrinsics, vectorization, and link-time code gen
+    add_compile_options(
+        $<$<CONFIG:Release>:/O2>
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/Ot>
+        $<$<CONFIG:Release>:/Oy>
+        $<$<CONFIG:Release>:/GL>
+        $<$<CONFIG:Release>:/Gy>
+        $<$<CONFIG:Release>:/Gw>
+        $<$<CONFIG:Release>:/arch:AVX2>
+    )
+
+    # Linker optimizations: LTCG, unreferenced data elimination, identical COMDAT folding
+    add_link_options(
+        $<$<CONFIG:Release>:/LTCG>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
 endif()
 
 # Source files

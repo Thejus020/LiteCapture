@@ -55,11 +55,15 @@ private:
     int64_t m_lastFpsCalcTimeNs{0};
     uint32_t m_fpsFrameCounter{0};
 
+    DWORD m_cachedBufferLength{0};
+
     int64_t m_firstAudioTimestampNs{0};
     LONGLONG m_lastAudioSampleTimeHns{-1};
     LONGLONG m_audioSamplesWritten{0};
 
-    mutable std::mutex m_mutex;
+    mutable std::mutex m_videoMutex;
+    mutable std::mutex m_audioMutex;
+    mutable std::mutex m_lifecycleMutex;
 };
 
 } // namespace LiteCapture::Encoder

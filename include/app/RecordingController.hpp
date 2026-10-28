@@ -8,6 +8,9 @@
 #include "capture/WgcCaptureEngine.hpp"
 #include <memory>
 #include <mutex>
+#include <queue>
+#include <thread>
+#include <condition_variable>
 #include <functional>
 
 #include "encoder/MfVideoEncoder.hpp"
@@ -63,9 +66,22 @@ public:
     }
 
 private:
+    struct QueuedFrame {
+        Core::ComPtr<ID3D11Texture2D> texture;
+        int64_t timestampNs{0};
+        int64_t durationNs{0};
+        uint32_t width{0};
+        uint32_t height{0};
+        uint64_t frameIndex{0};
+    };
+
     void SetState(RecordingState newState, const std::wstring& message = {});
     void OnCapturedFrame(const Capture::CapturedFrame& frame);
     void OnAudioFrame(const int16_t* pcm16, uint32_t frameCount, int64_t timestampNs);
+    void EncoderThreadProc();
+
+    static constexpr size_t MAX_QUEUE_DEPTH = 3;
+    static constexpr size_t TEXTURE_POOL_SIZE = 4;
 
     mutable std::mutex m_mutex;
     RecordingState m_state{RecordingState::Idle};
@@ -75,6 +91,18 @@ private:
     std::unique_ptr<Capture::ICaptureEngine> m_captureEngine;
     std::unique_ptr<Encoder::IVideoEncoder> m_encoder;
     std::unique_ptr<Audio::WasapiAudioCapture> m_audioCapture;
+
+    // Decoupled asynchronous encoding pipeline
+    std::vector<Core::ComPtr<ID3D11Texture2D>> m_texturePool;
+    std::queue<QueuedFrame> m_frameQueue;
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCv;
+    std::thread m_encoderThread;
+    std::atomic<bool> m_encoderThreadRunning{false};
+    std::atomic<uint64_t> m_framesDroppedQueue{0};
+
+    uint32_t m_targetWidth{1280};
+    uint32_t m_targetHeight{720};
 
     int64_t m_recordStartTimeNs{0};
     std::atomic<uint64_t> m_framesReceived{0};

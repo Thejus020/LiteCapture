@@ -43,6 +43,75 @@ private:
         bool isInitialized{false};
     };
 
+    struct AudioRingBuffer {
+        std::vector<float> buffer;
+        size_t capacity{0};
+        size_t head{0};
+        size_t tail{0};
+        size_t count{0};
+
+        void Init(size_t cap) {
+            capacity = cap;
+            buffer.assign(cap, 0.0f);
+            head = 0;
+            tail = 0;
+            count = 0;
+        }
+
+        void Clear() noexcept {
+            head = 0;
+            tail = 0;
+            count = 0;
+        }
+
+        size_t Available() const noexcept { return count; }
+        size_t FreeSpace() const noexcept { return capacity - count; }
+
+        void Push(const float* data, size_t numSamples) noexcept {
+            if (!data || numSamples == 0) return;
+            if (numSamples > capacity) {
+                data += (numSamples - capacity);
+                numSamples = capacity;
+                head = 0;
+                tail = 0;
+                count = 0;
+            } else if (numSamples > FreeSpace()) {
+                size_t overflow = numSamples - FreeSpace();
+                head = (head + overflow) % capacity;
+                count -= overflow;
+            }
+
+            size_t part1 = (std::min)(numSamples, capacity - tail);
+            memcpy(&buffer[tail], data, part1 * sizeof(float));
+            size_t part2 = numSamples - part1;
+            if (part2 > 0) {
+                memcpy(&buffer[0], data + part1, part2 * sizeof(float));
+            }
+            tail = (tail + numSamples) % capacity;
+            count += numSamples;
+        }
+
+        void Pop(float* dest, size_t numSamples) noexcept {
+            if (!dest || numSamples == 0 || count == 0) return;
+            numSamples = (std::min)(numSamples, count);
+
+            size_t part1 = (std::min)(numSamples, capacity - head);
+            memcpy(dest, &buffer[head], part1 * sizeof(float));
+            size_t part2 = numSamples - part1;
+            if (part2 > 0) {
+                memcpy(dest + part1, &buffer[0], part2 * sizeof(float));
+            }
+            head = (head + numSamples) % capacity;
+            count -= numSamples;
+        }
+
+        void Discard(size_t numSamples) noexcept {
+            numSamples = (std::min)(numSamples, count);
+            head = (head + numSamples) % capacity;
+            count -= numSamples;
+        }
+    };
+
     Core::Status SetupEndpoint(EDataFlow dataFlow, const std::wstring& preferredDeviceId, DWORD streamFlags, AudioEndpoint& endpoint);
     void ReleaseEndpoint(AudioEndpoint& endpoint);
     void CaptureThreadProc();
@@ -52,7 +121,7 @@ private:
         const BYTE* srcData,
         uint32_t numFrames,
         const AudioEndpoint& endpoint,
-        std::vector<float>& outStereoFloat,
+        AudioRingBuffer& outRing,
         bool isSilent
     );
 

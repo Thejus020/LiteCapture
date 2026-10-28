@@ -153,24 +153,32 @@ Core::Status WasapiAudioCapture::SetupEndpoint(
         return Core::Status::FromHResult(hr, L"MMDeviceEnumerator");
     }
 
-    // Use preferred device if specified, fallback to default
+    bool activated = false;
+    // 1. Try preferred device if specified
     if (!preferredDeviceId.empty()) {
         hr = enumerator->GetDevice(preferredDeviceId.c_str(), &endpoint.device);
-        if (FAILED(hr)) {
-            LC_LOG_WARN(std::format(L"Preferred device '{}' not found, falling back to default.", preferredDeviceId));
-            hr = enumerator->GetDefaultAudioEndpoint(dataFlow, eConsole, &endpoint.device);
+        if (SUCCEEDED(hr) && endpoint.device) {
+            hr = endpoint.device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &endpoint.client);
+            if (SUCCEEDED(hr) && endpoint.client) {
+                activated = true;
+            } else {
+                LC_LOG_WARN(std::format(L"Preferred device '{}' failed to activate (hr=0x{:08X}), falling back to default.", preferredDeviceId, static_cast<uint32_t>(hr)));
+                endpoint.client.Reset();
+                endpoint.device.Reset();
+            }
         }
-    } else {
+    }
+
+    // 2. Fall back to system default endpoint
+    if (!activated) {
         hr = enumerator->GetDefaultAudioEndpoint(dataFlow, eConsole, &endpoint.device);
-    }
-
-    if (FAILED(hr)) {
-        return Core::Status::FromHResult(hr, L"GetDefaultAudioEndpoint");
-    }
-
-    hr = endpoint.device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &endpoint.client);
-    if (FAILED(hr)) {
-        return Core::Status::FromHResult(hr, L"Activate IAudioClient");
+        if (FAILED(hr)) {
+            return Core::Status::FromHResult(hr, L"GetDefaultAudioEndpoint");
+        }
+        hr = endpoint.device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &endpoint.client);
+        if (FAILED(hr)) {
+            return Core::Status::FromHResult(hr, L"Activate IAudioClient on default device");
+        }
     }
 
     hr = endpoint.client->GetMixFormat(&endpoint.waveFormat);
@@ -287,20 +295,70 @@ void WasapiAudioCapture::ConvertToCanonicalFloatStereo(
     const BYTE* srcData,
     uint32_t numFrames,
     const AudioEndpoint& endpoint,
-    std::vector<float>& outStereoFloat,
+    AudioRingBuffer& outRing,
     bool isSilent
 ) {
     if (numFrames == 0) return;
 
-    uint32_t targetRate = 48000;
+    const uint32_t targetRate = 48000;
+
+    // Fast-path 1: Native 48kHz 32-bit float stereo (standard Windows WASAPI loopback/mic)
+    if (endpoint.sampleRate == targetRate && endpoint.channels == 2 && endpoint.isFloat && endpoint.bitsPerSample == 32) {
+        if (isSilent || !srcData) {
+            static const float zeros[960] = {0.0f};
+            uint32_t remaining = numFrames;
+            while (remaining > 0) {
+                uint32_t chunk = (std::min)(remaining, 480u);
+                outRing.Push(zeros, chunk * 2);
+                remaining -= chunk;
+            }
+        } else {
+            outRing.Push(reinterpret_cast<const float*>(srcData), numFrames * 2);
+        }
+        return;
+    }
+
+    // Fast-path 2: Native 48kHz 16-bit integer PCM stereo
+    if (endpoint.sampleRate == targetRate && endpoint.channels == 2 && endpoint.bitsPerSample == 16) {
+        if (isSilent || !srcData) {
+            static const float zeros[960] = {0.0f};
+            uint32_t remaining = numFrames;
+            while (remaining > 0) {
+                uint32_t chunk = (std::min)(remaining, 480u);
+                outRing.Push(zeros, chunk * 2);
+                remaining -= chunk;
+            }
+        } else {
+            const int16_t* pcm = reinterpret_cast<const int16_t*>(srcData);
+            float temp[960];
+            uint32_t remaining = numFrames;
+            size_t offset = 0;
+            while (remaining > 0) {
+                uint32_t chunk = (std::min)(remaining, 480u);
+                for (uint32_t i = 0; i < chunk * 2; ++i) {
+                    temp[i] = pcm[offset + i] * (1.0f / 32768.0f);
+                }
+                outRing.Push(temp, chunk * 2);
+                offset += chunk * 2;
+                remaining -= chunk;
+            }
+        }
+        return;
+    }
+
+    // General fallback: arbitrary sample rates, channel configurations, and bit depths
     double resampleRatio = static_cast<double>(endpoint.sampleRate) / static_cast<double>(targetRate);
     uint32_t outFrames = (endpoint.sampleRate == targetRate) ?
         numFrames : static_cast<uint32_t>(std::round(numFrames / resampleRatio));
 
-    size_t startIdx = outStereoFloat.size();
-    outStereoFloat.resize(startIdx + outFrames * 2, 0.0f);
-
     if (isSilent || !srcData) {
+        static const float zeros[960] = {0.0f};
+        uint32_t remaining = outFrames;
+        while (remaining > 0) {
+            uint32_t chunk = (std::min)(remaining, 480u);
+            outRing.Push(zeros, chunk * 2);
+            remaining -= chunk;
+        }
         return;
     }
 
@@ -347,6 +405,7 @@ void WasapiAudioCapture::ConvertToCanonicalFloatStereo(
         return {getSample(frameIdx, 0), getSample(frameIdx, 1)};
     };
 
+    std::vector<float> resampled(outFrames * 2);
     for (uint32_t i = 0; i < outFrames; ++i) {
         float left = 0.0f;
         float right = 0.0f;
@@ -367,9 +426,10 @@ void WasapiAudioCapture::ConvertToCanonicalFloatStereo(
             right = r0 + frac * (r1 - r0);
         }
 
-        outStereoFloat[startIdx + i * 2 + 0] = left;
-        outStereoFloat[startIdx + i * 2 + 1] = right;
+        resampled[i * 2 + 0] = left;
+        resampled[i * 2 + 1] = right;
     }
+    outRing.Push(resampled.data(), resampled.size());
 }
 
 void WasapiAudioCapture::CaptureThreadProc() {
@@ -389,18 +449,23 @@ void WasapiAudioCapture::CaptureThreadProc() {
     if (m_systemEndpoint.eventHandle) waitHandles.push_back(m_systemEndpoint.eventHandle);
     if (m_micEndpoint.eventHandle) waitHandles.push_back(m_micEndpoint.eventHandle);
 
-    std::vector<float> sysQueue;
-    std::vector<float> micQueue;
-    std::vector<float> tempPacket;
-    std::vector<int16_t> pcm16Chunk;
+    AudioRingBuffer sysQueue;
+    sysQueue.Init(48000 * 2); // 1-second capacity
+    AudioRingBuffer micQueue;
+    micQueue.Init(48000 * 2); // 1-second capacity
+
+    const uint32_t targetSampleRate = 48000;
+    const uint32_t CHUNK_FRAMES = 480; // 10ms at 48000 Hz
+
+    float sysChunk[CHUNK_FRAMES * 2];
+    float micChunk[CHUNK_FRAMES * 2];
+    int16_t pcm16Chunk[CHUNK_FRAMES * 2];
 
     bool sysActive = m_systemEndpoint.isInitialized;
     bool micActive = m_micEndpoint.isInitialized;
 
     int64_t captureStartTimeNs = Core::GetCurrentTimeNs();
     uint64_t totalFramesEmitted = 0;
-    const uint32_t targetSampleRate = 48000;
-    const uint32_t CHUNK_FRAMES = 480; // 10ms at 48000 Hz
 
     while (!m_stopRequested.load()) {
         DWORD waitResult = WaitForMultipleObjects(
@@ -423,9 +488,7 @@ void WasapiAudioCapture::CaptureThreadProc() {
                 DWORD flags = 0;
                 if (SUCCEEDED(m_systemEndpoint.captureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr))) {
                     bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                    tempPacket.clear();
-                    ConvertToCanonicalFloatStereo(pData, numFrames, m_systemEndpoint, tempPacket, isSilent);
-                    sysQueue.insert(sysQueue.end(), tempPacket.begin(), tempPacket.end());
+                    ConvertToCanonicalFloatStereo(pData, numFrames, m_systemEndpoint, sysQueue, isSilent);
                     m_systemFramesCaptured += numFrames;
                     m_systemEndpoint.captureClient->ReleaseBuffer(numFrames);
                 }
@@ -441,9 +504,7 @@ void WasapiAudioCapture::CaptureThreadProc() {
                 DWORD flags = 0;
                 if (SUCCEEDED(m_micEndpoint.captureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr))) {
                     bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                    tempPacket.clear();
-                    ConvertToCanonicalFloatStereo(pData, numFrames, m_micEndpoint, tempPacket, isSilent);
-                    micQueue.insert(micQueue.end(), tempPacket.begin(), tempPacket.end());
+                    ConvertToCanonicalFloatStereo(pData, numFrames, m_micEndpoint, micQueue, isSilent);
                     m_micFramesCaptured += numFrames;
                     m_micEndpoint.captureClient->ReleaseBuffer(numFrames);
                 }
@@ -451,8 +512,6 @@ void WasapiAudioCapture::CaptureThreadProc() {
         }
 
         // 3. Wall-Clock Synchronized Parallel Audio Mixer:
-        // Calculates exact expected audio frames from elapsed real-world time.
-        // Guarantees audio time strictly equals video wall-clock time with 0 drift.
         int64_t nowNs = Core::GetCurrentTimeNs();
         int64_t elapsedNs = nowNs - captureStartTimeNs;
         if (elapsedNs < 0) elapsedNs = 0;
@@ -460,8 +519,8 @@ void WasapiAudioCapture::CaptureThreadProc() {
         uint64_t targetTotalFrames = (static_cast<uint64_t>(elapsedNs) * targetSampleRate) / 1000000000ULL;
 
         while (!m_stopRequested.load()) {
-            size_t sysAvailable = sysActive ? (sysQueue.size() / 2) : 0;
-            size_t micAvailable = micActive ? (micQueue.size() / 2) : 0;
+            size_t sysAvailable = sysActive ? (sysQueue.Available() / 2) : 0;
+            size_t micAvailable = micActive ? (micQueue.Available() / 2) : 0;
 
             bool behindTarget = (totalFramesEmitted + CHUNK_FRAMES <= targetTotalFrames);
             bool queuesReady = false;
@@ -478,58 +537,42 @@ void WasapiAudioCapture::CaptureThreadProc() {
                 break;
             }
 
-            pcm16Chunk.resize(CHUNK_FRAMES * 2);
+            memset(sysChunk, 0, sizeof(sysChunk));
+            memset(micChunk, 0, sizeof(micChunk));
 
-            float sysVol = m_systemVolume.load();
-            float micVol = m_micVolume.load();
-
-            size_t sysConsume = (std::min)(sysAvailable, static_cast<size_t>(CHUNK_FRAMES));
-            size_t micConsume = (std::min)(micAvailable, static_cast<size_t>(CHUNK_FRAMES));
-
-            for (uint32_t i = 0; i < CHUNK_FRAMES; ++i) {
-                float leftSys = 0.0f;
-                float rightSys = 0.0f;
-                if (sysActive && i < sysConsume) {
-                    leftSys = sysQueue[i * 2 + 0] * sysVol;
-                    rightSys = sysQueue[i * 2 + 1] * sysVol;
-                }
-
-                float leftMic = 0.0f;
-                float rightMic = 0.0f;
-                if (micActive && i < micConsume) {
-                    leftMic = micQueue[i * 2 + 0] * micVol;
-                    rightMic = micQueue[i * 2 + 1] * micVol;
-                }
-
-                float mixL = std::clamp(leftSys + leftMic, -1.0f, 1.0f);
-                float mixR = std::clamp(rightSys + rightMic, -1.0f, 1.0f);
-
-                pcm16Chunk[i * 2 + 0] = static_cast<int16_t>(mixL * 32767.0f);
-                pcm16Chunk[i * 2 + 1] = static_cast<int16_t>(mixR * 32767.0f);
+            if (sysActive && sysAvailable > 0) {
+                size_t popCount = (std::min)(sysAvailable, static_cast<size_t>(CHUNK_FRAMES));
+                sysQueue.Pop(sysChunk, popCount * 2);
+            }
+            if (micActive && micAvailable > 0) {
+                size_t popCount = (std::min)(micAvailable, static_cast<size_t>(CHUNK_FRAMES));
+                micQueue.Pop(micChunk, popCount * 2);
             }
 
-            if (sysActive && sysConsume > 0) {
-                sysQueue.erase(sysQueue.begin(), sysQueue.begin() + sysConsume * 2);
-            }
-            if (micActive && micConsume > 0) {
-                micQueue.erase(micQueue.begin(), micQueue.begin() + micConsume * 2);
+            const float sysVol = m_systemVolume.load();
+            const float micVol = m_micVolume.load();
+
+            for (uint32_t i = 0; i < CHUNK_FRAMES * 2; ++i) {
+                float mix = sysChunk[i] * sysVol + micChunk[i] * micVol;
+                mix = (std::max)(-1.0f, (std::min)(1.0f, mix));
+                pcm16Chunk[i] = static_cast<int16_t>(mix * 32767.0f);
             }
 
             if (m_callback) {
-                m_callback(pcm16Chunk.data(), CHUNK_FRAMES, nowNs);
+                m_callback(pcm16Chunk, CHUNK_FRAMES, nowNs);
             }
 
             totalFramesEmitted += CHUNK_FRAMES;
             m_totalSamplesMixed = totalFramesEmitted;
         }
 
-        // 4. Drift protection: prevent queue accumulation beyond 100ms
-        const size_t MAX_QUEUE_SAMPLES = 4800 * 2; // 100ms
-        if (sysQueue.size() > MAX_QUEUE_SAMPLES) {
-            sysQueue.erase(sysQueue.begin(), sysQueue.begin() + (sysQueue.size() - 2400 * 2));
+        // 4. Drift protection: prevent queue accumulation beyond 100ms (4800 samples)
+        const size_t MAX_QUEUE_SAMPLES = 4800 * 2;
+        if (sysQueue.Available() > MAX_QUEUE_SAMPLES) {
+            sysQueue.Discard(sysQueue.Available() - 2400 * 2);
         }
-        if (micQueue.size() > MAX_QUEUE_SAMPLES) {
-            micQueue.erase(micQueue.begin(), micQueue.begin() + (micQueue.size() - 2400 * 2));
+        if (micQueue.Available() > MAX_QUEUE_SAMPLES) {
+            micQueue.Discard(micQueue.Available() - 2400 * 2);
         }
     }
 

@@ -97,7 +97,7 @@ void Logger::Log(LogLevel level, std::wstring_view message, const char* file, in
 
     std::wstring logLine;
     if (file && line > 0) {
-        std::string filenameOnly = std::filesystem::path(file).filename().string();
+        const char* filenameOnly = ExtractFilename(file);
         std::wstring wFilename = Utf8ToUtf16(filenameOnly);
         logLine = std::format(L"[{}] [{}] [TID:{:04X}] [{}:{}] {}\n",
             timestamp, levelStr, threadId, wFilename, line, message);
@@ -114,7 +114,9 @@ void Logger::Log(LogLevel level, std::wstring_view message, const char* file, in
     if (m_fileStream.is_open()) {
         std::string utf8Line = Utf16ToUtf8(logLine);
         m_fileStream << utf8Line;
-        m_fileStream.flush();
+        if (level >= LogLevel::Error) {
+            m_fileStream.flush();
+        }
     }
 }
 
