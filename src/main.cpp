@@ -6,7 +6,9 @@ int WINAPI wWinMain(
     _In_ LPWSTR lpCmdLine,
     _In_ int nCmdShow
 ) {
-    bool testCapture = (lpCmdLine && wcsstr(lpCmdLine, L"--test-capture") != nullptr);
+    (void)lpCmdLine;
+    LPWSTR cmdLine = GetCommandLineW();
+    bool testCapture = (cmdLine && wcsstr(cmdLine, L"--test-capture") != nullptr);
 
     // Single-instance enforcement: activate existing instance if already running in background/tray
     HANDLE hMutex = nullptr;

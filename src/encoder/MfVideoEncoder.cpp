@@ -1,5 +1,7 @@
 #include "encoder/MfVideoEncoder.hpp"
 #include "core/Logger.hpp"
+#include <icodecapi.h>
+#include <codecapi.h>
 #include <filesystem>
 #include <format>
 
@@ -169,6 +171,42 @@ Core::Status MfVideoEncoder::CreateMediaTypes() {
             LC_LOG_HR(hr, L"Failed to set input media type on SinkWriter");
             return Core::Status::FromHResult(hr, L"SetInputMediaType");
         }
+    }
+
+    // 3. Configure advanced encoder rate control via ICodecAPI:
+    // Set rate control mode to Unconstrained VBR so that static desktop scenes (with little or no movement)
+    // consume minimal bits rather than padding out to constant bitrate.
+    // Also enable CABAC entropy coding for 10-15% higher compression efficiency.
+    Core::ComPtr<ICodecAPI> codecApi;
+    hr = m_sinkWriter->GetServiceForStream(m_streamIndex, GUID_NULL, IID_PPV_ARGS(&codecApi));
+    if (SUCCEEDED(hr) && codecApi) {
+        VARIANT var;
+        VariantInit(&var);
+
+        // Rate control: Unconstrained VBR (eAVEncCommonRateControlMode_UnconstrainedVBR = 2)
+        var.vt = VT_UI4;
+        var.ulVal = eAVEncCommonRateControlMode_UnconstrainedVBR;
+        hr = codecApi->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
+        if (SUCCEEDED(hr)) {
+            LC_LOG_INFO(L"H.264 encoder rate control set to Unconstrained VBR for optimized file sizes.");
+        }
+
+        // Quality level (70 = optimal visual quality / small file size trade-off)
+        var.vt = VT_UI4;
+        var.ulVal = 70;
+        codecApi->SetValue(&CODECAPI_AVEncCommonQuality, &var);
+
+        // CABAC entropy encoding (more efficient than CAVLC)
+        var.vt = VT_BOOL;
+        var.boolVal = VARIANT_TRUE;
+        codecApi->SetValue(&CODECAPI_AVEncH264CABACEnable, &var);
+
+        // GOP size (Keyframe spacing = 2 seconds)
+        var.vt = VT_UI4;
+        var.ulVal = m_config.fps * 2;
+        codecApi->SetValue(&CODECAPI_AVEncMPVGOPSize, &var);
+
+        VariantClear(&var);
     }
 
     return Core::Status::Ok();

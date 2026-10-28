@@ -32,7 +32,7 @@ public:
     void SetStatusText(const std::wstring& status);
     void SetGpuInfo(const std::wstring& gpuInfo);
     void SetDisplaySources(const std::vector<Graphics::DisplayOutputInfo>& displays);
-    void UpdateRecordingStats(uint64_t durationSec, double fps, uint64_t droppedFrames, const std::wstring& encoderName);
+    void UpdateRecordingStats(uint64_t durationSec, double fps, uint64_t droppedFrames, uint64_t fileSizeBytes = 0, const std::wstring& encoderName = {});
 
     void ShowTrayNotification(const std::wstring& title, const std::wstring& message, DWORD infoFlags = NIIF_INFO);
     void MinimizeToTray();

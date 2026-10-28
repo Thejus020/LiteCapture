@@ -7,9 +7,11 @@
 namespace LiteCapture::App {
 
 enum class ProfilePreset {
-    LowOverhead = 0,    // 1280x720, 30 FPS, 4 Mbps
-    SmoothGameplay,     // 1280x720, 60 FPS, 6 Mbps
-    HigherDetail,       // 1366x768, 30 FPS, 8 Mbps
+    Compact = 0,        // 1280x720, 30 FPS, 1200 kbps (~9 MB/min - Smallest file size)
+    LowOverhead = 0,    // Backward compatibility alias
+    Balanced,           // 1280x720, 30 FPS, 2200 kbps (~16 MB/min - Standard / Recommended)
+    SmoothGameplay,     // 1280x720, 60 FPS, 4000 kbps (~30 MB/min - Smooth 60fps)
+    HigherDetail,       // 1366x768, 30 FPS, 5000 kbps (~37 MB/min - High Detail)
     Custom              // User defined
 };
 
@@ -18,16 +20,16 @@ struct RecordingProfile {
     uint32_t width{1280};
     uint32_t height{720};
     uint32_t fps{30};
-    uint32_t bitrateKbps{4000}; // in kbps (e.g., 4000 kbps = 4 Mbps)
+    uint32_t bitrateKbps{1200}; // in kbps (e.g., 1200 kbps = 1.2 Mbps for compact recordings)
 
     uint32_t BitrateBps() const { return bitrateKbps * 1000; }
 };
 
 struct AppConfig {
-    uint32_t configVersion{1};
+    uint32_t configVersion{2};
 
     // Video Profile
-    ProfilePreset profilePreset{ProfilePreset::LowOverhead};
+    ProfilePreset profilePreset{ProfilePreset::Compact};
     RecordingProfile activeProfile;
 
     // Output Directory

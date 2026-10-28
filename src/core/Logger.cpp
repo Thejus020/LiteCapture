@@ -114,9 +114,7 @@ void Logger::Log(LogLevel level, std::wstring_view message, const char* file, in
     if (m_fileStream.is_open()) {
         std::string utf8Line = Utf16ToUtf8(logLine);
         m_fileStream << utf8Line;
-        if (level >= LogLevel::Error) {
-            m_fileStream.flush();
-        }
+        m_fileStream.flush();
     }
 }
 

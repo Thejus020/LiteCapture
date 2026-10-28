@@ -103,6 +103,10 @@ private:
 
     uint32_t m_targetWidth{1280};
     uint32_t m_targetHeight{720};
+    uint32_t m_targetFps{30};
+    int64_t m_targetFrameIntervalNs{33333333};
+    int64_t m_lastQueuedTimestampNs{0};
+    std::atomic<uint64_t> m_framesThrottled{0};
 
     int64_t m_recordStartTimeNs{0};
     std::atomic<uint64_t> m_framesReceived{0};

@@ -427,20 +427,24 @@ void MainWindow::PopulateSources() {
 void MainWindow::PopulateProfiles() {
     SendMessageW(m_cmbProfile, CB_RESETCONTENT, 0, 0);
 
-    auto pA = App::AppConfig::GetPresetProfile(App::ProfilePreset::LowOverhead);
-    auto pB = App::AppConfig::GetPresetProfile(App::ProfilePreset::SmoothGameplay);
-    auto pC = App::AppConfig::GetPresetProfile(App::ProfilePreset::HigherDetail);
+    auto pA = App::AppConfig::GetPresetProfile(App::ProfilePreset::Compact);
+    auto pB = App::AppConfig::GetPresetProfile(App::ProfilePreset::Balanced);
+    auto pC = App::AppConfig::GetPresetProfile(App::ProfilePreset::SmoothGameplay);
+    auto pD = App::AppConfig::GetPresetProfile(App::ProfilePreset::HigherDetail);
 
     SendMessageW(m_cmbProfile, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(pA.name.c_str()));
     SendMessageW(m_cmbProfile, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(pB.name.c_str()));
     SendMessageW(m_cmbProfile, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(pC.name.c_str()));
+    SendMessageW(m_cmbProfile, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(pD.name.c_str()));
 
-    SendMessageW(m_cmbProfile, CB_SETCURSEL, static_cast<int>(m_config.profilePreset), 0);
+    int sel = static_cast<int>(m_config.profilePreset);
+    if (sel < 0 || sel > 3) sel = 0;
+    SendMessageW(m_cmbProfile, CB_SETCURSEL, sel, 0);
 }
 
 void MainWindow::OnProfileChanged() {
     int curSel = static_cast<int>(SendMessageW(m_cmbProfile, CB_GETCURSEL, 0, 0));
-    if (curSel >= 0 && curSel <= 2) {
+    if (curSel >= 0 && curSel <= 3) {
         m_config.profilePreset = static_cast<App::ProfilePreset>(curSel);
         m_config.activeProfile = App::AppConfig::GetPresetProfile(m_config.profilePreset);
         m_config.Save();
@@ -779,13 +783,20 @@ void MainWindow::SetStatusText(const std::wstring& status) {
     }
 }
 
-void MainWindow::UpdateRecordingStats(uint64_t durationSec, double fps, uint64_t droppedFrames, const std::wstring& encoderName) {
+void MainWindow::UpdateRecordingStats(uint64_t durationSec, double fps, uint64_t droppedFrames, uint64_t fileSizeBytes, const std::wstring& encoderName) {
     uint64_t hours = durationSec / 3600;
     uint64_t mins  = (durationSec % 3600) / 60;
     uint64_t secs  = durationSec % 60;
 
-    std::wstring statsStr = std::format(L"Duration: {:02d}:{:02d}:{:02d}   |   FPS: {:.1f}   |   Dropped: {}",
-        hours, mins, secs, fps, droppedFrames);
+    double sizeMb = static_cast<double>(fileSizeBytes) / (1024.0 * 1024.0);
+    std::wstring statsStr;
+    if (fileSizeBytes > 0) {
+        statsStr = std::format(L"Duration: {:02d}:{:02d}:{:02d}   |   FPS: {:.1f}   |   Size: {:.1f} MB   |   Dropped: {}",
+            hours, mins, secs, fps, sizeMb, droppedFrames);
+    } else {
+        statsStr = std::format(L"Duration: {:02d}:{:02d}:{:02d}   |   FPS: {:.1f}   |   Dropped: {}",
+            hours, mins, secs, fps, droppedFrames);
+    }
     SetWindowTextW(m_lblStats, statsStr.c_str());
 
     if (!encoderName.empty()) {
@@ -939,12 +950,19 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 m_recordDurationSec++;
                 double fps = 0.0;
                 uint64_t dropped = 0;
+                uint64_t fileSizeBytes = 0;
+                std::wstring encName = L"Windows Media Foundation (Live)";
                 if (m_controller) {
                     auto stats = m_controller->GetStats();
-                    fps = stats.captureFps;
+                    auto encStats = m_controller->GetEncoderStats();
+                    fps = encStats.actualFps > 0 ? encStats.actualFps : stats.captureFps;
                     dropped = stats.framesDropped;
+                    fileSizeBytes = encStats.fileSizeBytes;
+                    if (!encStats.encoderName.empty()) {
+                        encName = encStats.encoderName;
+                    }
                 }
-                UpdateRecordingStats(m_recordDurationSec, fps, dropped, L"Windows Graphics Capture (Live)");
+                UpdateRecordingStats(m_recordDurationSec, fps, dropped, fileSizeBytes, encName);
                 return 0;
             }
             break;

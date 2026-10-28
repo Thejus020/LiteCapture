@@ -83,6 +83,10 @@ Core::Status RecordingController::StartRecording(const AppConfig& config, const 
 
     m_targetWidth = config.activeProfile.width;
     m_targetHeight = config.activeProfile.height;
+    m_targetFps = config.activeProfile.fps > 0 ? config.activeProfile.fps : 30;
+    m_targetFrameIntervalNs = 1000000000LL / m_targetFps;
+    m_lastQueuedTimestampNs = 0;
+    m_framesThrottled = 0;
 
     // 1. Generate timestamped MP4 recording file path
     auto now = std::chrono::system_clock::now();
@@ -307,6 +311,18 @@ void RecordingController::OnCapturedFrame(const Capture::CapturedFrame& frame) {
     if (!m_encoderThreadRunning.load() || !frame.texture) {
         return;
     }
+
+    // Frame rate pacing: skip incoming capture frames that exceed the target recording FPS
+    // (e.g. when display refresh rate is 60Hz/144Hz and target profile is 30 FPS).
+    // Allow a small 2ms jitter tolerance so slight scheduling variations don't drop legitimate frames.
+    if (m_lastQueuedTimestampNs > 0) {
+        int64_t elapsedNs = frame.timestampNs - m_lastQueuedTimestampNs;
+        if (elapsedNs < (m_targetFrameIntervalNs - 2000000LL)) {
+            m_framesThrottled++;
+            return;
+        }
+    }
+    m_lastQueuedTimestampNs = frame.timestampNs;
 
     uint64_t count = ++m_framesReceived;
 

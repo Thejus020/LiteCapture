@@ -8,33 +8,40 @@ namespace LiteCapture::App {
 RecordingProfile AppConfig::GetPresetProfile(ProfilePreset preset) {
     RecordingProfile p;
     switch (preset) {
-        case ProfilePreset::LowOverhead:
-            p.name = L"Profile A - Low Overhead (720p 30fps 4Mbps)";
+        case ProfilePreset::Compact:
+            p.name = L"Profile A - Compact / Small File Size (720p 30fps ~1.2Mbps, ~9MB/min)";
             p.width = 1280;
             p.height = 720;
             p.fps = 30;
-            p.bitrateKbps = 4000;
+            p.bitrateKbps = 1200;
+            break;
+        case ProfilePreset::Balanced:
+            p.name = L"Profile B - Balanced (720p 30fps ~2.2Mbps, ~16MB/min)";
+            p.width = 1280;
+            p.height = 720;
+            p.fps = 30;
+            p.bitrateKbps = 2200;
             break;
         case ProfilePreset::SmoothGameplay:
-            p.name = L"Profile B - Smooth Gameplay (720p 60fps 6Mbps)";
+            p.name = L"Profile C - Smooth Motion (720p 60fps ~4Mbps, ~30MB/min)";
             p.width = 1280;
             p.height = 720;
             p.fps = 60;
-            p.bitrateKbps = 6000;
+            p.bitrateKbps = 4000;
             break;
         case ProfilePreset::HigherDetail:
-            p.name = L"Profile C - Higher Detail (768p 30fps 8Mbps)";
+            p.name = L"Profile D - High Detail (768p 30fps ~5Mbps, ~37MB/min)";
             p.width = 1366;
             p.height = 768;
             p.fps = 30;
-            p.bitrateKbps = 8000;
+            p.bitrateKbps = 5000;
             break;
         case ProfilePreset::Custom:
             p.name = L"Custom Profile";
             p.width = 1280;
             p.height = 720;
             p.fps = 30;
-            p.bitrateKbps = 4000;
+            p.bitrateKbps = 1500;
             break;
     }
     return p;
@@ -71,14 +78,33 @@ bool AppConfig::Load() {
     if (!std::filesystem::exists(configFile)) {
         LC_LOG_INFO(L"Config file does not exist, initializing defaults.");
         outputDirectory = GetDefaultOutputDirectory();
-        activeProfile = GetPresetProfile(ProfilePreset::LowOverhead);
+        activeProfile = GetPresetProfile(ProfilePreset::Compact);
+        configVersion = 2;
         Save();
         return true;
     }
 
     configVersion = GetPrivateProfileIntW(L"General", L"Version", 1, configFile.c_str());
 
+    // Upgrade older v1 configuration to v2 with optimized compact bitrates
+    if (configVersion < 2) {
+        outputDirectory = GetDefaultOutputDirectory();
+        wchar_t outDirBuffer[MAX_PATH] = {0};
+        GetPrivateProfileStringW(L"Storage", L"OutputDirectory", outputDirectory.c_str(), outDirBuffer, MAX_PATH, configFile.c_str());
+        outputDirectory = outDirBuffer;
+
+        configVersion = 2;
+        profilePreset = ProfilePreset::Compact;
+        activeProfile = GetPresetProfile(profilePreset);
+        Save();
+        LC_LOG_INFO(L"Upgraded configuration to version 2 with compact video recording presets.");
+        return true;
+    }
+
     int presetVal = GetPrivateProfileIntW(L"Video", L"Preset", 0, configFile.c_str());
+    if (presetVal < 0 || presetVal > static_cast<int>(ProfilePreset::HigherDetail)) {
+        presetVal = 0;
+    }
     profilePreset = static_cast<ProfilePreset>(presetVal);
     activeProfile = GetPresetProfile(profilePreset);
 
